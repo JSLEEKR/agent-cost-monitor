@@ -74,6 +74,54 @@ PRICING = {
 }
 
 
+class Session:
+    """A named cost tracking scope within a CostTracker."""
+
+    def __init__(self, name: str, tracker: "CostTracker"):
+        self.name = name
+        self._tracker = tracker
+        self._usages: list[Usage] = []
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_cost = 0.0
+
+    def record(self, model, input_tokens, output_tokens):
+        """Record usage on both this session and the parent tracker."""
+        usage = self._tracker.record(model, input_tokens, output_tokens)
+        self._usages.append(usage)
+        self._total_input_tokens += usage.input_tokens
+        self._total_output_tokens += usage.output_tokens
+        self._total_cost += usage.cost
+        return usage
+
+    @property
+    def total_cost(self):
+        return self._total_cost
+
+    @property
+    def total_input_tokens(self):
+        return self._total_input_tokens
+
+    @property
+    def total_output_tokens(self):
+        return self._total_output_tokens
+
+    def summary(self):
+        return {
+            "session_name": self.name,
+            "total_cost": round(self._total_cost, 6),
+            "total_input_tokens": self._total_input_tokens,
+            "total_output_tokens": self._total_output_tokens,
+            "num_requests": len(self._usages),
+        }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 class CostTracker:
     def __init__(self, budget=None, max_history=DEFAULT_MAX_HISTORY,
                  on_budget_exceeded=None, raise_on_budget=False):
@@ -85,6 +133,7 @@ class CostTracker:
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_cost = 0.0
+        self._sessions: dict[str, Session] = {}
 
     def record(self, model, input_tokens, output_tokens):
         if not isinstance(input_tokens, int) or input_tokens < 0:
@@ -153,6 +202,19 @@ class CostTracker:
                 models[u.model] = 0.0
             models[u.model] += u.cost
         return {k: round(v, 6) for k, v in models.items()}
+
+    def session(self, name: str) -> Session:
+        """Create or retrieve a named session for scoped cost tracking."""
+        if name not in self._sessions:
+            self._sessions[name] = Session(name, self)
+        return self._sessions[name]
+
+    def cost_by_session(self) -> dict:
+        """Return cost breakdown by session name."""
+        return {
+            name: round(s.total_cost, 6)
+            for name, s in self._sessions.items()
+        }
 
     def reset(self):
         self._usages.clear()

@@ -3,7 +3,7 @@ import io
 import json
 
 import pytest
-from agent_cost_monitor import CostTracker, BudgetExceededError, track_usage
+from agent_cost_monitor import CostTracker, BudgetExceededError, Session, track_usage
 
 
 def test_record_and_total_cost():
@@ -308,3 +308,86 @@ def test_report_shows_correct_request_count():
     tracker.record("gpt-4o", 300, 150)
     report = tracker.report()
     assert "3" in report
+
+
+# --- Session tests ---
+
+
+def test_session_tracks_cost_independently():
+    tracker = CostTracker()
+    s1 = tracker.session("task-1")
+    s2 = tracker.session("task-2")
+    s1.record("gpt-4o", 1000, 500)
+    s2.record("claude-sonnet-4-6", 2000, 1000)
+    # Each session only sees its own cost
+    expected_s1 = 1000 * (2.50 / 1e6) + 500 * (10.0 / 1e6)
+    expected_s2 = 2000 * (3.0 / 1e6) + 1000 * (15.0 / 1e6)
+    assert abs(s1.total_cost - expected_s1) < 1e-9
+    assert abs(s2.total_cost - expected_s2) < 1e-9
+
+
+def test_session_records_propagate_to_parent_tracker():
+    tracker = CostTracker()
+    s = tracker.session("task-1")
+    s.record("gpt-4o", 1000, 500)
+    s.record("gpt-4o", 2000, 800)
+    # Parent tracker should have both records
+    assert tracker.total_input_tokens == 3000
+    assert tracker.total_output_tokens == 1300
+    assert tracker.summary()["num_requests"] == 2
+    assert abs(tracker.total_cost - s.total_cost) < 1e-9
+
+
+def test_cost_by_session_returns_correct_breakdown():
+    tracker = CostTracker()
+    s1 = tracker.session("task-1")
+    s2 = tracker.session("task-2")
+    s1.record("gpt-4o", 1000, 500)
+    s2.record("gpt-4o", 2000, 1000)
+    by_session = tracker.cost_by_session()
+    assert "task-1" in by_session
+    assert "task-2" in by_session
+    expected_s1 = round(1000 * (2.50 / 1e6) + 500 * (10.0 / 1e6), 6)
+    expected_s2 = round(2000 * (2.50 / 1e6) + 1000 * (10.0 / 1e6), 6)
+    assert by_session["task-1"] == expected_s1
+    assert by_session["task-2"] == expected_s2
+
+
+def test_session_context_manager():
+    tracker = CostTracker()
+    with tracker.session("ctx-task") as s:
+        s.record("claude-sonnet-4-6", 500, 200)
+        s.record("claude-sonnet-4-6", 300, 100)
+    assert s.summary()["num_requests"] == 2
+    assert tracker.summary()["num_requests"] == 2
+    assert abs(tracker.total_cost - s.total_cost) < 1e-9
+
+
+def test_session_summary_includes_name():
+    tracker = CostTracker()
+    s = tracker.session("my-session")
+    s.record("gpt-4o", 100, 50)
+    summary = s.summary()
+    assert summary["session_name"] == "my-session"
+    assert summary["num_requests"] == 1
+    assert summary["total_input_tokens"] == 100
+    assert summary["total_output_tokens"] == 50
+
+
+def test_session_returns_same_instance_for_same_name():
+    tracker = CostTracker()
+    s1 = tracker.session("task-1")
+    s2 = tracker.session("task-1")
+    assert s1 is s2
+
+
+def test_cost_by_session_empty():
+    tracker = CostTracker()
+    assert tracker.cost_by_session() == {}
+
+
+def test_session_with_budget_enforcement():
+    tracker = CostTracker(budget=0.0, raise_on_budget=True)
+    s = tracker.session("expensive-task")
+    with pytest.raises(BudgetExceededError):
+        s.record("gpt-4o", 1000, 500)
