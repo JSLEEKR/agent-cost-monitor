@@ -3,9 +3,11 @@ import io
 import json
 import os
 import tempfile
+from datetime import datetime, timezone, timedelta
 
 import pytest
 from agent_cost_monitor import CostTracker, BudgetExceededError, Session, track_usage
+from agent_cost_monitor.tracker import Usage
 
 
 def test_record_and_total_cost():
@@ -490,3 +492,127 @@ def test_load_non_dict_json_returns_fresh_tracker():
             json.dump([1, 2, 3], f)
         loaded = CostTracker.load(path)
         assert loaded.total_cost == 0.0
+
+
+# --- Anomaly detection tests ---
+
+
+def test_anomaly_detected_on_spike():
+    tracker = CostTracker()
+    # Record 5 normal usages (small)
+    for _ in range(5):
+        tracker.record("gpt-4o-mini", 100, 50)
+    # Now record a spike (much larger)
+    spike_usage = tracker.record("claude-opus-4-6", 100000, 50000)
+    anomaly = tracker.check_anomaly(spike_usage)
+    assert anomaly is not None
+    assert anomaly["type"] == "spike"
+    assert anomaly["ratio"] > 3.0
+    assert "cost" in anomaly
+    assert "avg_cost" in anomaly
+
+
+def test_no_anomaly_on_normal_usage():
+    tracker = CostTracker()
+    # Record 5 normal usages with the same model and tokens
+    for _ in range(5):
+        tracker.record("gpt-4o", 1000, 500)
+    # Record another similar usage
+    normal_usage = tracker.record("gpt-4o", 1000, 500)
+    anomaly = tracker.check_anomaly(normal_usage)
+    assert anomaly is None
+
+
+def test_no_anomaly_with_fewer_than_5_records():
+    tracker = CostTracker()
+    for _ in range(4):
+        tracker.record("gpt-4o", 1000, 500)
+    # Only 4 records, spike should not trigger anomaly
+    spike_usage = tracker.record("claude-opus-4-6", 100000, 50000)
+    anomaly = tracker.check_anomaly(spike_usage)
+    assert anomaly is None
+
+
+def test_on_anomaly_callback_called():
+    anomalies = []
+    tracker = CostTracker(
+        on_anomaly=lambda anomaly, usage, t: anomalies.append(
+            (anomaly, usage, t)
+        )
+    )
+    for _ in range(5):
+        tracker.record("gpt-4o-mini", 100, 50)
+    tracker.record("claude-opus-4-6", 100000, 50000)
+    assert len(anomalies) == 1
+    anomaly, usage, t = anomalies[0]
+    assert anomaly["type"] == "spike"
+    assert usage.model == "claude-opus-4-6"
+    assert t is tracker
+
+
+def test_on_anomaly_callback_not_called_on_normal():
+    anomalies = []
+    tracker = CostTracker(
+        on_anomaly=lambda anomaly, usage, t: anomalies.append(anomaly)
+    )
+    for _ in range(6):
+        tracker.record("gpt-4o", 1000, 500)
+    assert len(anomalies) == 0
+
+
+# --- Rate tracking tests ---
+
+
+def test_cost_per_minute():
+    tracker = CostTracker()
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    # Manually create usages with controlled timestamps
+    for i in range(5):
+        usage = Usage(
+            model="gpt-4o",
+            input_tokens=1000,
+            output_tokens=500,
+            timestamp=(base_time + timedelta(minutes=i)).isoformat(),
+        )
+        tracker._usages.append(usage)
+        tracker._total_input_tokens += usage.input_tokens
+        tracker._total_output_tokens += usage.output_tokens
+        tracker._total_cost += usage.cost
+    # 5 usages over 4 minutes
+    cpm = tracker.cost_per_minute()
+    assert cpm > 0
+    expected_total_cost = tracker.total_cost
+    expected_cpm = expected_total_cost / 4.0
+    assert abs(cpm - expected_cpm) < 1e-9
+
+
+def test_requests_per_minute():
+    tracker = CostTracker()
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    for i in range(6):
+        usage = Usage(
+            model="gpt-4o",
+            input_tokens=1000,
+            output_tokens=500,
+            timestamp=(base_time + timedelta(minutes=i * 2)).isoformat(),
+        )
+        tracker._usages.append(usage)
+        tracker._total_input_tokens += usage.input_tokens
+        tracker._total_output_tokens += usage.output_tokens
+        tracker._total_cost += usage.cost
+    # 6 usages over 10 minutes
+    rpm = tracker.requests_per_minute()
+    expected_rpm = 6 / 10.0
+    assert abs(rpm - expected_rpm) < 1e-9
+
+
+def test_cost_per_minute_single_record():
+    tracker = CostTracker()
+    tracker.record("gpt-4o", 1000, 500)
+    assert tracker.cost_per_minute() == 0.0
+
+
+def test_requests_per_minute_single_record():
+    tracker = CostTracker()
+    tracker.record("gpt-4o", 1000, 500)
+    assert tracker.requests_per_minute() == 0.0

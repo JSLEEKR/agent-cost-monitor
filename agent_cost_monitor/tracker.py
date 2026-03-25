@@ -126,12 +126,13 @@ class Session:
 class CostTracker:
     def __init__(self, budget=None, max_history=DEFAULT_MAX_HISTORY,
                  on_budget_exceeded=None, raise_on_budget=False,
-                 auto_save=None):
+                 auto_save=None, on_anomaly=None):
         self.budget = budget
         self.max_history = max_history
         self.on_budget_exceeded = on_budget_exceeded
         self.raise_on_budget = raise_on_budget
         self.auto_save = auto_save
+        self.on_anomaly = on_anomaly
         self._usages = deque(maxlen=max_history)
         self._total_input_tokens = 0
         self._total_output_tokens = 0
@@ -168,6 +169,9 @@ class CostTracker:
                     f"Budget of {self.budget} exceeded: "
                     f"total cost is {self.total_cost:.6f}"
                 )
+        anomaly = self.check_anomaly(usage)
+        if anomaly is not None and self.on_anomaly is not None:
+            self.on_anomaly(anomaly, usage, self)
         if self.auto_save is not None:
             self.save(self.auto_save)
         return usage
@@ -220,6 +224,55 @@ class CostTracker:
             name: round(s.total_cost, 6)
             for name, s in self._sessions.items()
         }
+
+    def check_anomaly(self, usage) -> dict | None:
+        """Check if the given usage is anomalous (cost >3x the running average).
+
+        Returns None if normal or if fewer than 5 previous records exist.
+        Returns a dict with type, cost, avg_cost, and ratio if anomalous.
+        """
+        # Need at least 5 *previous* records (excluding the one just added)
+        # The usage passed in is already in self._usages, so we need len >= 6
+        if len(self._usages) < 6:
+            return None
+        # Calculate average cost of all records except the last one
+        costs = [u.cost for u in list(self._usages)[:-1]]
+        avg_cost = sum(costs) / len(costs)
+        if avg_cost == 0:
+            return None
+        ratio = usage.cost / avg_cost
+        if ratio > 3.0:
+            return {
+                "type": "spike",
+                "cost": usage.cost,
+                "avg_cost": avg_cost,
+                "ratio": ratio,
+            }
+        return None
+
+    def cost_per_minute(self) -> float:
+        """Average cost per minute based on timestamps of recorded usages."""
+        if len(self._usages) < 2:
+            return 0.0
+        usages = list(self._usages)
+        first_ts = datetime.fromisoformat(usages[0].timestamp)
+        last_ts = datetime.fromisoformat(usages[-1].timestamp)
+        elapsed_minutes = (last_ts - first_ts).total_seconds() / 60.0
+        if elapsed_minutes <= 0:
+            return 0.0
+        return self._total_cost / elapsed_minutes
+
+    def requests_per_minute(self) -> float:
+        """Average requests per minute based on timestamps of recorded usages."""
+        if len(self._usages) < 2:
+            return 0.0
+        usages = list(self._usages)
+        first_ts = datetime.fromisoformat(usages[0].timestamp)
+        last_ts = datetime.fromisoformat(usages[-1].timestamp)
+        elapsed_minutes = (last_ts - first_ts).total_seconds() / 60.0
+        if elapsed_minutes <= 0:
+            return 0.0
+        return len(self._usages) / elapsed_minutes
 
     def reset(self):
         self._usages.clear()
