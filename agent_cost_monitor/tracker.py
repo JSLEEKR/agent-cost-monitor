@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -124,11 +125,13 @@ class Session:
 
 class CostTracker:
     def __init__(self, budget=None, max_history=DEFAULT_MAX_HISTORY,
-                 on_budget_exceeded=None, raise_on_budget=False):
+                 on_budget_exceeded=None, raise_on_budget=False,
+                 auto_save=None):
         self.budget = budget
         self.max_history = max_history
         self.on_budget_exceeded = on_budget_exceeded
         self.raise_on_budget = raise_on_budget
+        self.auto_save = auto_save
         self._usages = deque(maxlen=max_history)
         self._total_input_tokens = 0
         self._total_output_tokens = 0
@@ -165,6 +168,8 @@ class CostTracker:
                     f"Budget of {self.budget} exceeded: "
                     f"total cost is {self.total_cost:.6f}"
                 )
+        if self.auto_save is not None:
+            self.save(self.auto_save)
         return usage
 
     @property
@@ -244,6 +249,91 @@ class CostTracker:
             writer.writerow([u.timestamp, u.model, u.input_tokens,
                              u.output_tokens, round(u.cost, 6)])
         return buf.getvalue()
+
+    def save(self, path: str) -> None:
+        """Save full tracker state to a JSON file."""
+        state = {
+            "budget": self.budget,
+            "max_history": self.max_history,
+            "usages": [
+                {
+                    "model": u.model,
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                    "timestamp": u.timestamp,
+                }
+                for u in self._usages
+            ],
+            "sessions": {
+                name: [
+                    {
+                        "model": u.model,
+                        "input_tokens": u.input_tokens,
+                        "output_tokens": u.output_tokens,
+                        "timestamp": u.timestamp,
+                    }
+                    for u in s._usages
+                ]
+                for name, s in self._sessions.items()
+            },
+        }
+        with open(path, "w") as f:
+            json.dump(state, f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "CostTracker":
+        """Load tracker state from a JSON file.
+
+        Returns a fresh CostTracker if the file is missing or corrupted.
+        """
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return cls()
+
+        if not isinstance(state, dict):
+            return cls()
+
+        budget = state.get("budget")
+        max_history = state.get("max_history", DEFAULT_MAX_HISTORY)
+        tracker = cls(budget=budget, max_history=max_history)
+
+        for u_data in state.get("usages", []):
+            usage = Usage(
+                model=u_data["model"],
+                input_tokens=u_data["input_tokens"],
+                output_tokens=u_data["output_tokens"],
+                timestamp=u_data.get("timestamp",
+                                     datetime.now(timezone.utc).isoformat()),
+            )
+            if len(tracker._usages) == tracker.max_history:
+                evicted = tracker._usages[0]
+                tracker._total_input_tokens -= evicted.input_tokens
+                tracker._total_output_tokens -= evicted.output_tokens
+                tracker._total_cost -= evicted.cost
+            tracker._usages.append(usage)
+            tracker._total_input_tokens += usage.input_tokens
+            tracker._total_output_tokens += usage.output_tokens
+            tracker._total_cost += usage.cost
+
+        for session_name, session_usages in state.get("sessions", {}).items():
+            session = tracker.session(session_name)
+            for u_data in session_usages:
+                usage = Usage(
+                    model=u_data["model"],
+                    input_tokens=u_data["input_tokens"],
+                    output_tokens=u_data["output_tokens"],
+                    timestamp=u_data.get(
+                        "timestamp",
+                        datetime.now(timezone.utc).isoformat()),
+                )
+                session._usages.append(usage)
+                session._total_input_tokens += usage.input_tokens
+                session._total_output_tokens += usage.output_tokens
+                session._total_cost += usage.cost
+
+        return tracker
 
     def report(self) -> str:
         w = 40

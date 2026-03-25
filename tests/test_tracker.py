@@ -1,6 +1,8 @@
 import csv
 import io
 import json
+import os
+import tempfile
 
 import pytest
 from agent_cost_monitor import CostTracker, BudgetExceededError, Session, track_usage
@@ -391,3 +393,100 @@ def test_session_with_budget_enforcement():
     s = tracker.session("expensive-task")
     with pytest.raises(BudgetExceededError):
         s.record("gpt-4o", 1000, 500)
+
+
+# --- Persistence tests ---
+
+
+def test_save_creates_file():
+    tracker = CostTracker(budget=5.0)
+    tracker.record("gpt-4o", 1000, 500)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "state.json")
+        tracker.save(path)
+        assert os.path.exists(path)
+        with open(path) as f:
+            data = json.load(f)
+        assert isinstance(data, dict)
+        assert data["budget"] == 5.0
+        assert len(data["usages"]) == 1
+
+
+def test_load_restores_state():
+    tracker = CostTracker(budget=2.0)
+    tracker.record("gpt-4o", 1000, 500)
+    tracker.record("claude-sonnet-4-6", 2000, 1000)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "state.json")
+        tracker.save(path)
+        loaded = CostTracker.load(path)
+    assert loaded.budget == 2.0
+    assert loaded.total_input_tokens == 3000
+    assert loaded.total_output_tokens == 1500
+    assert abs(loaded.total_cost - tracker.total_cost) < 1e-9
+    assert loaded.summary()["num_requests"] == 2
+
+
+def test_load_restores_sessions():
+    tracker = CostTracker()
+    s = tracker.session("task-1")
+    s.record("gpt-4o", 1000, 500)
+    s.record("gpt-4o", 500, 200)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "state.json")
+        tracker.save(path)
+        loaded = CostTracker.load(path)
+    by_session = loaded.cost_by_session()
+    assert "task-1" in by_session
+    assert abs(by_session["task-1"] - tracker.cost_by_session()["task-1"]) < 1e-9
+
+
+def test_load_restores_budget():
+    tracker = CostTracker(budget=10.0)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "state.json")
+        tracker.save(path)
+        loaded = CostTracker.load(path)
+    assert loaded.budget == 10.0
+
+
+def test_auto_save_writes_on_each_record():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "auto.json")
+        tracker = CostTracker(auto_save=path)
+        tracker.record("gpt-4o", 1000, 500)
+        # File should exist after first record
+        assert os.path.exists(path)
+        with open(path) as f:
+            data = json.load(f)
+        assert len(data["usages"]) == 1
+        tracker.record("gpt-4o", 2000, 800)
+        with open(path) as f:
+            data = json.load(f)
+        assert len(data["usages"]) == 2
+
+
+def test_load_missing_file_returns_fresh_tracker():
+    loaded = CostTracker.load("/nonexistent/path/state.json")
+    assert loaded.total_cost == 0.0
+    assert loaded.summary()["num_requests"] == 0
+    assert loaded.budget is None
+
+
+def test_load_corrupted_file_returns_fresh_tracker():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "bad.json")
+        with open(path, "w") as f:
+            f.write("not valid json {{{")
+        loaded = CostTracker.load(path)
+        assert loaded.total_cost == 0.0
+        assert loaded.summary()["num_requests"] == 0
+
+
+def test_load_non_dict_json_returns_fresh_tracker():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "bad.json")
+        with open(path, "w") as f:
+            json.dump([1, 2, 3], f)
+        loaded = CostTracker.load(path)
+        assert loaded.total_cost == 0.0
